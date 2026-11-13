@@ -270,6 +270,21 @@ async fn advance_native_queue(app: &Arc<Mutex<App>>) {
   loop {
     let track = {
       let mut guard = app.lock().await;
+      // Leave the head in place while Qobuz resolves its constants off-pump.
+      #[cfg(feature = "qobuz")]
+      if guard
+        .native_queue
+        .first()
+        .and_then(|track| track.uri.as_deref())
+        .is_some_and(crate::infra::qobuz::dispatch::is_qobuz_uri)
+        && crate::infra::qobuz::dispatch::defer_constants(
+          app,
+          &mut guard,
+          IoEvent::AdvanceNativeQueue,
+        )
+      {
+        return;
+      }
       if guard.native_queue.is_empty() {
         None
       } else {
