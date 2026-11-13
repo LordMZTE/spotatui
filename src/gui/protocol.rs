@@ -20,6 +20,7 @@ use crate::core::theme::{resolve, Color, Palette, Theme, ThemeField};
 use crate::core::update::{UpdateAsk, UpdateStatus};
 use crate::core::user_config::KeyBindings;
 use crate::core::visualizer_look::VisualizerLook;
+use crate::gui::covers::CoverLinks;
 use crate::gui::onboarding::{OnboardingReply, OnboardingView};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1019,8 +1020,16 @@ pub(crate) fn resync(app: &App, language: Option<Language>) -> Vec<ServerMessage
     .collect()
 }
 
-pub(crate) fn encode(message: &ServerMessage) -> String {
-  serde_json::to_string(message).expect("a protocol message serializes")
+pub(super) fn encode(message: &ServerMessage, covers: &CoverLinks) -> String {
+  let mut value = serde_json::to_value(message).expect("a protocol message serializes");
+  covers.rewrite(&mut value);
+  serde_json::to_string(&value).expect("a protocol value serializes")
+}
+
+pub(super) fn decode(text: &str, covers: &CoverLinks) -> Result<ClientMessage, serde_json::Error> {
+  let mut value = serde_json::from_str(text)?;
+  covers.restore(&mut value);
+  serde_json::from_value(value)
 }
 
 fn channel_message(
@@ -1880,6 +1889,126 @@ mod tests {
   fn app() -> (App, Receiver<IoEvent>) {
     let (tx, rx) = std::sync::mpsc::channel();
     (App::new(tx, UserConfig::new(), Some(SystemTime::now())), rx)
+  }
+
+  #[test]
+  fn subsonic_list_covers_hide_the_login_on_resync_and_updates() {
+    use crate::core::app::{
+      AlbumTableContext, Artist, ArtistBlock, SelectedAlbum, TrackTableContext,
+    };
+    const COVER: &str =
+      "https://music.example/rest/getCoverArt.view?u=alice&t=secret&s=salt&id=art";
+    let (mut app, _rx) = app();
+    let before = app.display_revisions();
+    let mut track = crate::core::test_helpers::queued_track("subsonic:track:1", "One");
+    track.image_url = Some(COVER.to_string());
+    let album = AlbumInfo {
+      uri: Some("subsonic:album:1".to_string()),
+      image_url: Some(COVER.to_string()),
+      tracks: vec![track.clone()],
+      ..Default::default()
+    };
+    app.set_search_results(crate::core::app::SearchResult {
+      tracks: Some(Paged {
+        items: vec![track.clone()],
+        ..Default::default()
+      }),
+      albums: Some(Paged {
+        items: vec![album.clone()],
+        ..Default::default()
+      }),
+      ..Default::default()
+    });
+    app.set_track_table(vec![track.clone()], TrackTableContext::SubsonicPlaylist);
+    app.apply(Action::QueueTrack(track.clone()));
+    app.selected_album_simplified = Some(SelectedAlbum {
+      album: album.clone(),
+      tracks: Paged {
+        items: vec![track.clone()],
+        ..Default::default()
+      },
+      selected_index: 0,
+    });
+    app.album_table_context = AlbumTableContext::Simplified;
+    app.artist = Some(Artist {
+      artist_id: "artist".to_string(),
+      artist_name: "Artist".to_string(),
+      image_url: Some(COVER.to_string()),
+      albums: Paged {
+        items: vec![album],
+        ..Default::default()
+      },
+      related_artists: vec![],
+      top_tracks: vec![track],
+      selected_album_index: 0,
+      selected_related_artist_index: 0,
+      selected_top_track_index: 0,
+      artist_hovered_block: ArtistBlock::TopTracks,
+      artist_selected_block: ArtistBlock::TopTracks,
+    });
+    app.note_display_changes();
+    app.bump_display(DisplayDomain::Album);
+    app.bump_display(DisplayDomain::Artist);
+    let covers = CoverLinks::default();
+    for messages in [resync(&app, None), diff(&before, &app, Language::En)] {
+      let encoded: Vec<_> = messages
+        .iter()
+        .map(|message| encode(message, &covers))
+        .collect();
+      assert!(encoded
+        .iter()
+        .all(|text| !text.contains("t=secret") && !text.contains("getCoverArt")));
+      for (kind, path) in [
+        ("search", "/payload/tracks/0/image_url"),
+        ("queue", "/payload/native/0/image_url"),
+        ("track_table", "/payload/tracks/0/image_url"),
+        ("album", "/payload/album/tracks/0/image_url"),
+        ("artist", "/payload/page/top_tracks/0/image_url"),
+      ] {
+        let message = encoded
+          .iter()
+          .map(|text| serde_json::from_str::<serde_json::Value>(text).unwrap())
+          .find(|value| value["kind"] == kind)
+          .unwrap();
+        let reference = message.pointer(path).unwrap().as_str().unwrap();
+        assert_eq!(covers.resolve(reference).as_deref(), Some(COVER), "{kind}");
+      }
+    }
+  }
+
+  #[test]
+  fn queued_page_rows_restore_only_registered_cover_references() {
+    let covers = CoverLinks::default();
+    let private = "https://music.example/rest/getCoverArt.view?u=alice&p=password&id=art";
+    let mut row = serde_json::json!({"image_url": private});
+    covers.rewrite(&mut row);
+    let mut track = crate::core::test_helpers::queued_track("subsonic:track:1", "One");
+    track.image_url = Some(format!(
+      "/cover?uri={}&t=session",
+      row["image_url"].as_str().unwrap().replace(':', "%3A")
+    ));
+    let ClientMessage::Action { action } = decode(
+      &action_frame(Action::QueueTracks(vec![track.clone()])),
+      &covers,
+    )
+    .unwrap() else {
+      panic!("expected queued tracks")
+    };
+    let Action::QueueTracks(tracks) = *action else {
+      panic!("expected queued tracks")
+    };
+    assert_eq!(tracks[0].image_url.as_deref(), Some(private));
+
+    track.image_url = Some(private.to_string());
+    let ClientMessage::Action { action } =
+      decode(&action_frame(Action::QueueTrack(track)), &covers).unwrap()
+    else {
+      panic!("expected a queued track")
+    };
+    let Action::QueueTrack(track) = *action else {
+      panic!("expected a queued track")
+    };
+    assert_eq!(track.image_url, None);
   }
 
   #[test]
@@ -2869,7 +2998,10 @@ mod tests {
   #[test]
   fn hello_says_whether_a_shell_can_resize_its_window() {
     let (app, _rx) = app();
-    let message = encode(&hello(app.display_revisions(), None, true, Language::En));
+    let message = encode(
+      &hello(app.display_revisions(), None, true, Language::En),
+      &CoverLinks::default(),
+    );
     let hello: serde_json::Value = serde_json::from_str(&message).unwrap();
     assert_eq!(hello["payload"]["window"], true);
     let ClientMessage::Window { mode } =
